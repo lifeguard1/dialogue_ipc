@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <errno.h>
+#include <signal.h>
+#include <stdatomic.h>
 
 #define MAX_PARTICIPANTS 10
 #define MAX_DIALOGUES 10
@@ -45,6 +47,12 @@ typedef struct{
     int current_dialogues_count;
     Dialogue dialogues_shm[MAX_DIALOGUES];
 } SharedMemory;
+
+struct thread_args{
+  int dialogue_index;
+  int pid;
+  atomic_bool terminate_flag;
+};
 
 SharedMemory *shm_ptr = NULL;
 int fd = -1;
@@ -103,6 +111,7 @@ int startup(){
     perror("shm_open of initializer failed");
     return -1;
   }
+  return 0;
 }
 
 int join_dialogue(pid_t pid, int dialogue_id){
@@ -189,18 +198,18 @@ int remove_process_from_dialogue(pid_t pid, int dialogue_index){
   // if its already free, return
   if(shm_ptr->dialogues_shm[dialogue_index].status == DIALOGUE_FREE)  return 0; 
 
-  pthread_mutex_lock(shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+  pthread_mutex_lock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
 
   for(int i=0; i<MAX_PARTICIPANTS; i++){
     if(shm_ptr->dialogues_shm[dialogue_index].participants[i] == pid){
-     shm_ptr->dialogues_shm[dialogue_index].participants[i] == 0;
+     shm_ptr->dialogues_shm[dialogue_index].participants[i] = 0;
      shm_ptr->dialogues_shm[dialogue_index].participant_count--;
      break; 
     }
   }
 
   int current_participants = shm_ptr->dialogues_shm[dialogue_index].participant_count;
-  pthread_mutex_unlock(shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+  pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
 
   if(current_participants == 0){
     pthread_mutex_lock(&shm_ptr->system_mutex);
@@ -208,22 +217,26 @@ int remove_process_from_dialogue(pid_t pid, int dialogue_index){
     shm_ptr->dialogues_shm[dialogue_index].status = DIALOGUE_FREE;
     shm_ptr->dialogues_shm[dialogue_index].dialogue_id = 0;
     shm_ptr->current_dialogues_count--;
-    pthread_mutex_unlock(shm_ptr->system_mutex);
+    pthread_mutex_unlock(&shm_ptr->system_mutex);
   }
 
   return 1;
 }
 
-void *sender_thread(){
+void *sender_thread(void *arg){
+
+  struct thread_args *a = (struct thread_args *)arg;
+  int dialogue_index = a->dialogue_index;
+  int pid = a->pid;
 
   char input[MSG_BUFFER_SIZE];
 
-  while(1){
+  while(!a->terminate_flag){
     //print menu
     printf("\n====== AVAILABLE ACTIONS ======\n");
     printf("1. Send message\n");
     printf("2. Leave current dialogue\n");
-    printf("3. Terminate via (ctrl-c) or "TERMINATE" payload message\n");
+    printf("3. Terminate via (ctrl-c) or TERMINATE payload message\n");
 
     fgets(input, MSG_BUFFER_SIZE, stdin);
 
@@ -233,7 +246,7 @@ void *sender_thread(){
     pthread_mutex_lock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
 
     // check if message slot is empty
-    if(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.status == MESSAGE_FULL){
+    if(shm_ptr->dialogues_shm[dialogue_index].msg_struct.status == MESSAGE_FULL){
       printf("Error, slot is busy. Try again later.\n");
       pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
       continue; // retry the loop
@@ -241,14 +254,11 @@ void *sender_thread(){
 
     int isTerminate = (strcmp(input, "TERMINATE") == 0); // if input is "TERMINATE" strcmp will return 0 so isTerminate will be true
 
-    if(isTerminate){
-       strncpy(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, input, MSG_BUFFER_SIZE);
-    }else{
-       strncpy(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, input, MSG_BUFFER_SIZE);
-    }
+    strncpy(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, input, MSG_BUFFER_SIZE);
 
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.status = MESSAGE_FULL;
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.sender_id = pid;
+    shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining = shm_ptr->dialogues_shm[dialogue_index].participant_count;
 
     for(int i=0; i<shm_ptr->dialogues_shm[dialogue_index].participant_count; i++){
       sem_post(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
@@ -258,10 +268,54 @@ void *sender_thread(){
 
     if(isTerminate){
       // trigger cleanup
-      cleanup(SIGINT);
       break;
     }
   }
+  return NULL;
+}
+
+void *receiver_thread(void *arg){
+
+  struct thread_args *a = (struct thread_args *)arg;
+  int dialogue_index = a->dialogue_index;
+  int pid = a->pid;
+
+  while(1){
+
+    sem_wait(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
+    pthread_mutex_lock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+
+    if(shm_ptr->dialogues_shm[dialogue_index].msg_struct.sender_id == pid){
+      // if its writer's process do nothing (only decrement), checking later if its terminate payload
+    }else{
+      printf("\n\nDialogue ID: %d | Sent by: %d\n", shm_ptr->dialogues_shm[dialogue_index].dialogue_id, shm_ptr->dialogues_shm[dialogue_index].msg_struct.sender_id);
+      printf("Message: %s\n", shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload);
+
+      // case for terminating thread/process/dialogue
+      if(strcmp(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, "TERMINATE") == 0){
+        shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining--;
+        if(shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining <= 0){
+          shm_ptr->dialogues_shm[dialogue_index].msg_struct.status = MESSAGE_FREE;
+        }
+        pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+        pthread_exit(NULL);  // terminate thread
+      }
+    }
+    shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining--;
+
+    // if this was last reader mark message slot as empty
+    if(shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining <= 0){
+       shm_ptr->dialogues_shm[dialogue_index].msg_struct.status = MESSAGE_FREE;
+    }
+
+    //check if same's process write wrote TERMINATE
+    if(strcmp(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, "TERMINATE") == 0){
+       pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+       pthread_exit(NULL);  // terminate thread
+    }
+    pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+  }
+
   return NULL;
 }
 
@@ -283,18 +337,27 @@ int main(int argc, char *argv[]){
   }
 
   // initializing memory failed
-  if(startup() == -1){
+  int v = startup();
+  if(v == -1){
     return -1;
   }
 
-  if(join_dialogue(mypid, dialogue_id) == -1){
+  int dialogue_index = join_dialogue(mypid, dialogue_id);
+  if(dialogue_index == -1){
     return -1;
   }
+
+  struct thread_args *args = malloc(sizeof(struct thread_args));
+  args->dialogue_index = dialogue_index;
+  args->pid = mypid;
+  atomic_init(&args->terminate_flag, 0);
 
   pthread_t sender, receiver;
 
-  pthread_create(&sender, NULL, sender_thread, NULL);
-  pthread_create(&receiver, NULL, receiver_thread, NULL);
+  pthread_create(&sender, NULL, sender_thread, args);
+  pthread_create(&receiver, NULL, receiver_thread, args);
+
+  free(args);
 
 
   pthread_join(sender, NULL);
