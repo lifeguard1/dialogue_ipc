@@ -19,9 +19,13 @@
 #define DIALOGUE_FREE 0
 #define DIALOGUE_ACTIVE 1
 
+#define MESSAGE_FREE 0
+#define MESSAGE_FULL 1
+
 typedef struct{
-    unsigned int sender_id;
+    int sender_id;
     sem_t sync_sem;
+    int status;
     char payload[MSG_BUFFER_SIZE];
     pthread_mutex_t msg_mutex;
     int readers_remaining;
@@ -42,12 +46,6 @@ typedef struct{
     Dialogue dialogues_shm[MAX_DIALOGUES];
 } SharedMemory;
 
-// --- Process specific struct --- //
-typedef struct{
-    int current_dialogue_id;
-    
-}
-
 SharedMemory *shm_ptr = NULL;
 int fd = -1;
 
@@ -57,6 +55,54 @@ void init_pshared_mutex_attr(pthread_mutexattr_t *attr){
 
     // must set attr to be shared between processes
     pthread_mutexattr_setpshared(attr, PTHREAD_PROCESS_SHARED);
+}
+
+// Initialize memory
+int startup(){
+
+  pthread_mutexattr_t mutex_attr;
+  init_pshared_mutex_attr(&mutex_attr);
+
+  // if shm exists then fd's value will remain -1
+  // this can help us determine if its creator process or not
+  fd = shm_open(SHM_NAME, O_CREAT | O_EXCL | O_RDWR , 0666);
+
+  // if shm_open failed fd value is kept as -1 
+  if(fd != -1){
+
+    ftruncate(fd, sizeof(SharedMemory));
+
+    // map the virtual address space of the process to SharedMemory
+    shm_ptr = mmap(0, sizeof(SharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if(shm_ptr == MAP_FAILED){ perror("mmap of first process failed"); return -1; }
+
+    pthread_mutex_init(&shm_ptr->system_mutex, &mutex_attr);
+    memset(shm_ptr->dialogues_shm, 0, sizeof(shm_ptr->dialogues_shm)); // initialize(zero-out) the entire dialogue struct
+
+    // Initialize mutexes and semaphores for all available dialogue slots
+    for(int i = 0; i < MAX_DIALOGUES; i++){
+        pthread_mutex_init(&shm_ptr->dialogues_shm[i].msg_struct.msg_mutex, &mutex_attr);
+        if(sem_init(&shm_ptr->dialogues_shm[i].msg_struct.sync_sem, 1, 0) == -1){        // initialize the semaphore once in first calling prcoess
+           perror("sem_init failed"); return -1;
+      }
+    }
+
+  }else if(errno == EEXIST){
+      // shared memory object already exists so just open it
+      fd = shm_open(SHM_NAME, O_RDWR, 0666);
+      if(fd == -1){
+        perror("shm_open fail");
+        return 1;
+      }
+
+      // map the virtual address space of the process to SharedMemory
+      shm_ptr = mmap(0, sizeof(SharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if(shm_ptr == MAP_FAILED){ perror("mmap of client process failed"); return -1; }
+
+  }else{
+    perror("shm_open of initializer failed");
+    return -1;
+  }
 }
 
 int join_dialogue(pid_t pid, int dialogue_id){
@@ -85,7 +131,7 @@ int join_dialogue(pid_t pid, int dialogue_id){
         shm_ptr->last_dialogue_id++;         // updated last dialogue create
         shm_ptr->current_dialogues_count++;
         pthread_mutex_unlock(&shm_ptr->system_mutex);
-        return 1;
+        return dialogue_index;
     }else{
         // no empty slot for new dialogue
         printf("No empty slot for new dialogue creation. Exiting...\n");
@@ -118,7 +164,7 @@ int join_dialogue(pid_t pid, int dialogue_id){
            shm_ptr->dialogues_shm[dialogue_index].participants[pos] = pid;
            pthread_mutex_unlock(&shm_ptr->system_mutex);
            printf("Joined dialogue ID: %d\n", dialogue_id);
-           return 1;
+           return dialogue_index;
         }else{
            // this should never happen but rare case for faulty previous update
            printf("Error available dialogue but no participant empty slot.\n");
@@ -136,8 +182,87 @@ int join_dialogue(pid_t pid, int dialogue_id){
   return -1;
 }
 
-int remove_process_from_dialogue(pid_t pid, ){
-  
+// function to remove a process from a dialogue
+// this function does not cause cleanup or a Terminate
+int remove_process_from_dialogue(pid_t pid, int dialogue_index){
+
+  // if its already free, return
+  if(shm_ptr->dialogues_shm[dialogue_index].status == DIALOGUE_FREE)  return 0; 
+
+  pthread_mutex_lock(shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+
+  for(int i=0; i<MAX_PARTICIPANTS; i++){
+    if(shm_ptr->dialogues_shm[dialogue_index].participants[i] == pid){
+     shm_ptr->dialogues_shm[dialogue_index].participants[i] == 0;
+     shm_ptr->dialogues_shm[dialogue_index].participant_count--;
+     break; 
+    }
+  }
+
+  int current_participants = shm_ptr->dialogues_shm[dialogue_index].participant_count;
+  pthread_mutex_unlock(shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+
+  if(current_participants == 0){
+    pthread_mutex_lock(&shm_ptr->system_mutex);
+    printf("Deleting dialogue ID: %d\n", shm_ptr->dialogues_shm[dialogue_index].dialogue_id);
+    shm_ptr->dialogues_shm[dialogue_index].status = DIALOGUE_FREE;
+    shm_ptr->dialogues_shm[dialogue_index].dialogue_id = 0;
+    shm_ptr->current_dialogues_count--;
+    pthread_mutex_unlock(shm_ptr->system_mutex);
+  }
+
+  return 1;
+}
+
+void *sender_thread(){
+
+  char input[MSG_BUFFER_SIZE];
+
+  while(1){
+    //print menu
+    printf("\n====== AVAILABLE ACTIONS ======\n");
+    printf("1. Send message\n");
+    printf("2. Leave current dialogue\n");
+    printf("3. Terminate via (ctrl-c) or "TERMINATE" payload message\n");
+
+    fgets(input, MSG_BUFFER_SIZE, stdin);
+
+    // remove new line character
+    input[strcspn(input, "\n")] = 0;
+
+    pthread_mutex_lock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+
+    // check if message slot is empty
+    if(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.status == MESSAGE_FULL){
+      printf("Error, slot is busy. Try again later.\n");
+      pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+      continue; // retry the loop
+    }
+
+    int isTerminate = (strcmp(input, "TERMINATE") == 0); // if input is "TERMINATE" strcmp will return 0 so isTerminate will be true
+
+    if(isTerminate){
+       strncpy(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, input, MSG_BUFFER_SIZE);
+    }else{
+       strncpy(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, input, MSG_BUFFER_SIZE);
+    }
+
+    shm_ptr->dialogues_shm[dialogue_index].msg_struct.status = MESSAGE_FULL;
+    shm_ptr->dialogues_shm[dialogue_index].msg_struct.sender_id = pid;
+
+    for(int i=0; i<shm_ptr->dialogues_shm[dialogue_index].participant_count; i++){
+      sem_post(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
+    }
+
+    pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+
+    if(isTerminate){
+      // trigger cleanup
+      cleanup(SIGINT);
+      break;
+    }
+  }
+  return NULL;
 }
 
 
@@ -147,6 +272,8 @@ int main(int argc, char *argv[]){
   int dialogue_id;
   pid_t mypid = getpid();
 
+  signal(SIGINT, cleanup);
+
   if(argc > 1){
     dialogue_id = atoi(argv[1]);
     printf("Entering dialogue ID: %d\n", dialogue_id);
@@ -155,47 +282,8 @@ int main(int argc, char *argv[]){
     return 1;
   }
 
-  pthread_mutexattr_t mutex_attr;
-  init_pshared_mutex_attr(&mutex_attr);
-
-  // if shm exists then fd's value will remain -1
-  // this can help us determine if its creator process or not
-  fd = shm_open(SHM_NAME, O_CREAT | O_EXCL | O_RDWR , 0666);
-
-  // if shm_open failed fd value is kept as -1 
-  if(fd != -1){
-
-    ftruncate(fd, sizeof(SharedMemory));
-
-    // map the virtual address space of the process to SharedMemory
-    shm_ptr = mmap(0, sizeof(SharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if(shm_ptr == MAP_FAILED){ perror("mmap of first process failed"); return -1; }
-    
-    pthread_mutex_init(&shm_ptr->system_mutex, &mutex_attr);
-    memset(shm_ptr->dialogues_shm, 0, sizeof(shm_ptr->dialogues_shm)); // initialize(zero-out) the entire dialogue struct
-
-    // Initialize mutexes and semaphores for all available dialogue slots
-    for(int i = 0; i < MAX_DIALOGUES; i++){
-        pthread_mutex_init(&shm_ptr->dialogues_shm[i].msg_struct.msg_mutex, &mutex_attr);
-        if(sem_init(&shm_ptr->dialogues_shm[i].msg_struct.sync_sem, 1, 0) == -1){        // initialize the semaphore once in first calling prcoess
-           perror("sem_init failed"); return -1;
-      }
-    }
-
-  }else if(errno == EEXIST){
-      // shared memory object already exists so just open it
-      fd = shm_open(SHM_NAME, O_RDWR, 0666);
-      if(fd == -1){
-        perror("shm_open fail");
-        return 1;
-      }
-    
-      // map the virtual address space of the process to SharedMemory
-      shm_ptr = mmap(0, sizeof(SharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-      if(shm_ptr == MAP_FAILED){ perror("mmap of client process failed"); return -1; }
-
-  }else{
-    perror("shm_open of initializer failed");
+  // initializing memory failed
+  if(startup() == -1){
     return -1;
   }
 
@@ -203,6 +291,14 @@ int main(int argc, char *argv[]){
     return -1;
   }
 
+  pthread_t sender, receiver;
+
+  pthread_create(&sender, NULL, sender_thread, NULL);
+  pthread_create(&receiver, NULL, receiver_thread, NULL);
+
+
+  pthread_join(sender, NULL);
+  pthread_cancel(receiver);
 
   return 0;
 }
