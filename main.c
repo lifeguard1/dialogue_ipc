@@ -13,7 +13,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
-# include <sys/select.h>
+#include <sys/select.h>
 
 #define MAX_PARTICIPANTS 10
 #define MAX_DIALOGUES 10
@@ -223,6 +223,7 @@ int remove_process_from_dialogue(pid_t pid, int dialogue_index){
   int current_participants = shm_ptr->dialogues_shm[dialogue_index].participant_count;
   pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
 
+  // mark dialogue as free
   if(current_participants == 0){
     pthread_mutex_lock(&shm_ptr->system_mutex);
     printf("PID: %d was only participant. Deleting dialogue ID: %d\n", pid, shm_ptr->dialogues_shm[dialogue_index].dialogue_id);
@@ -256,6 +257,9 @@ void *sender_thread(void *arg){
     fflush(stdout);
 
     int data_available = 0;
+    
+    // inner while loop to not get stuck on fgets
+    // if input from user then it breaks from loop
     while(!atomic_load(&a->terminate_flag) && !data_available){
         FD_ZERO(&readfds);
         FD_SET(STDIN_FILENO, &readfds);
@@ -305,11 +309,11 @@ void *sender_thread(void *arg){
 
     strncpy(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, input, MSG_BUFFER_SIZE);
 
-    shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload[MSG_BUFFER_SIZE - 1] = '\0';
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.status = MESSAGE_FULL;
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.sender_id = pid;
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining = shm_ptr->dialogues_shm[dialogue_index].participant_count;
 
+    // increase the semaphore value for each participant
     for(int i=0; i<shm_ptr->dialogues_shm[dialogue_index].participant_count; i++){
       sem_post(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
     }
@@ -336,10 +340,12 @@ void *receiver_thread(void *arg){
   int dialogue_index = a->dialogue_index;
   pid_t pid = a->pid;
 
+  // make sure terminate_flag is not raised
   while(!atomic_load(&a->terminate_flag)){
 
     sem_wait(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
 
+    // check for flag again
     if(atomic_load(&a->terminate_flag)){
       break;
     }
@@ -392,6 +398,7 @@ void cleanup(int sig){
   if(global_dialogue_index >= 0){
     int rem = remove_process_from_dialogue(global_pid, global_dialogue_index);
 
+    // if return value was 0 it means no more dialogues remaining
     if(rem <= 0){
       printf("Last dialogue closed. removing shared memory...\n");
       munmap(shm_ptr, sizeof(SharedMemory));
@@ -418,6 +425,7 @@ int main(int argc, char *argv[]){
 
   global_pid = mypid;
 
+  // signal handler helps us do a safe cleanup on ctrl-c
   signal(SIGINT, cleanup);
 
   if(argc > 1){
