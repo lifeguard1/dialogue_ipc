@@ -63,7 +63,7 @@ SharedMemory *shm_ptr = NULL;
 int fd = -1;
 struct thread_args *global_args = NULL;  // Need reference to set terminate_flag
 
-void cleanup(int sig);
+void cleanup();
 
 // Function to enable sychronization of mutex between processes
 void init_pshared_mutex_attr(pthread_mutexattr_t *attr){
@@ -383,7 +383,7 @@ void *receiver_thread(void *arg){
   return NULL;
 }
 
-void cleanup(int sig){
+void cleanup(){
   if(shm_ptr == NULL){
     exit(0);
   }
