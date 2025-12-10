@@ -13,6 +13,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
+# include <sys/select.h>
 
 #define MAX_PARTICIPANTS 10
 #define MAX_DIALOGUES 10
@@ -60,6 +61,7 @@ pid_t global_pid = 0;
 int global_dialogue_index = -1;
 SharedMemory *shm_ptr = NULL;
 int fd = -1;
+struct thread_args *global_args = NULL;  // Need reference to set terminate_flag
 
 void cleanup(int sig);
 
@@ -98,6 +100,7 @@ int startup(){
     // Initialize mutexes and semaphores for all available dialogue slots
     for(int i = 0; i < MAX_DIALOGUES; i++){
         pthread_mutex_init(&shm_ptr->dialogues_shm[i].msg_struct.msg_mutex, &mutex_attr);
+        shm_ptr->dialogues_shm[i].status = DIALOGUE_FREE;
         if(sem_init(&shm_ptr->dialogues_shm[i].msg_struct.sync_sem, 1, 0) == -1){        // initialize the semaphore once in first calling prcoess
            perror("sem_init failed"); return -1;
       }
@@ -147,6 +150,7 @@ int join_dialogue(pid_t pid, int dialogue_id){
         shm_ptr->dialogues_shm[dialogue_index].status = DIALOGUE_ACTIVE;
         shm_ptr->last_dialogue_id++;         // updated last dialogue create
         shm_ptr->current_dialogues_count++;
+        printf("Process ID: %d. Created Dialogue ID: %d\n", pid, new_dialogue_id);
         pthread_mutex_unlock(&shm_ptr->system_mutex);
         return dialogue_index;
     }else{
@@ -221,11 +225,12 @@ int remove_process_from_dialogue(pid_t pid, int dialogue_index){
 
   if(current_participants == 0){
     pthread_mutex_lock(&shm_ptr->system_mutex);
-    printf("Deleting dialogue ID: %d\n", shm_ptr->dialogues_shm[dialogue_index].dialogue_id);
+    printf("PID: %d was only participant. Deleting dialogue ID: %d\n", pid, shm_ptr->dialogues_shm[dialogue_index].dialogue_id);
     shm_ptr->dialogues_shm[dialogue_index].status = DIALOGUE_FREE;
     shm_ptr->dialogues_shm[dialogue_index].dialogue_id = 0;
     shm_ptr->current_dialogues_count--;
     pthread_mutex_unlock(&shm_ptr->system_mutex);
+    return shm_ptr->current_dialogues_count;
   }
 
   return 1;
@@ -239,13 +244,44 @@ void *sender_thread(void *arg){
 
   char input[MSG_BUFFER_SIZE];
 
+  fd_set readfds;
+  struct timeval tv;
+  int retval;
+
   while(!atomic_load(&a->terminate_flag)){
     //print menu
     printf("\n====== AVAILABLE ACTIONS ======\n");
-    printf("1. Send message\n");
-    printf("2. Terminate via (ctrl-c) or TERMINATE payload message\n");
+    printf("Send message, (CTRL-C) to kill process and remove it from dialogue or type TERMINATE to kill dialogue.\n");
     printf("> ");
     fflush(stdout);
+
+    int data_available = 0;
+    while(!atomic_load(&a->terminate_flag) && !data_available){
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+
+        //set timeout to 1 second
+        //must reset this every time because select updates it
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        // monitor stdin(fd 0) for reading
+        retval = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv);
+
+        if (retval == -1) {
+            if (errno == EINTR) continue; // interrupted by signal, retry
+            perror("select error");
+            break; 
+        } else if (retval > 0) {
+            // data is available on stdin
+            data_available = 1;
+        }
+        //if retval==0, it was a timeout so loop back to check terminate_flag
+    }
+
+    // If loop exited because of flag, break immediately
+    if(atomic_load(&a->terminate_flag)){
+      break;
+    }
 
     fgets(input, MSG_BUFFER_SIZE, stdin);
 
@@ -285,7 +321,12 @@ void *sender_thread(void *arg){
       atomic_store(&a->terminate_flag, true);
       break;
     }
+
+    if(atomic_load(&a->terminate_flag)){
+      break;
+    }
   }
+  
   return NULL;
 }
 
@@ -324,6 +365,11 @@ void *receiver_thread(void *arg){
 
     if(isTerminate){
       printf("TERMINATE received, receiver exiting...\n");
+      atomic_store(&a->terminate_flag, true);
+      break;
+    }
+
+    if(atomic_load(&a->terminate_flag)){
       break;
     }
   }
@@ -338,18 +384,30 @@ void cleanup(int sig){
 
   printf("\nCleaning up...\n");
 
+  // signal threads to stop
+  if(global_args != NULL){
+    atomic_store(&global_args->terminate_flag, true);
+  }
+
   if(global_dialogue_index >= 0){
     int rem = remove_process_from_dialogue(global_pid, global_dialogue_index);
 
-    if(rem == 0){
+    if(rem <= 0){
       printf("Last dialogue closed. removing shared memory...\n");
       munmap(shm_ptr, sizeof(SharedMemory));
       shm_unlink(SHM_NAME);
+      close(fd);
+      exit(0);
+    }else{
+      printf("Process removed. Other dialogues still active.\n");
+      munmap(shm_ptr, sizeof(SharedMemory));
+      close(fd);
       exit(0);
     }
   }
     munmap(shm_ptr, sizeof(SharedMemory));
-    shm_unlink(SHM_NAME);
+    close(fd);
+    exit(0);
 }
 
 int main(int argc, char *argv[]){
@@ -364,7 +422,6 @@ int main(int argc, char *argv[]){
 
   if(argc > 1){
     dialogue_id = atoi(argv[1]);
-    printf("Entering dialogue ID: %d\n", dialogue_id);
   } else{
     printf("Incorrect command line arguments. Exiting...\n");
     return 1;
@@ -390,6 +447,8 @@ int main(int argc, char *argv[]){
   args->pid = mypid;
   atomic_init(&args->terminate_flag, 0);
 
+  global_args = args;
+
   pthread_t sender, receiver;
 
   pthread_create(&sender, NULL, sender_thread, args);
@@ -400,7 +459,7 @@ int main(int argc, char *argv[]){
 
   int rem = remove_process_from_dialogue(mypid, dialogue_index);
 
-  if(rem == 0){
+  if(rem <= 0){
       printf("Last dialogue closed. removing shared memory...\n");
       munmap(shm_ptr, sizeof(SharedMemory));
       shm_unlink(SHM_NAME);
