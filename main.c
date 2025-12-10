@@ -11,6 +11,8 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 #define MAX_PARTICIPANTS 10
 #define MAX_DIALOGUES 10
@@ -25,7 +27,7 @@
 #define MESSAGE_FULL 1
 
 typedef struct{
-    int sender_id;
+    pid_t sender_id;
     sem_t sync_sem;
     int status;
     char payload[MSG_BUFFER_SIZE];
@@ -50,12 +52,16 @@ typedef struct{
 
 struct thread_args{
   int dialogue_index;
-  int pid;
+  pid_t pid;
   atomic_bool terminate_flag;
 };
 
+pid_t global_pid = 0;
+int global_dialogue_index = -1;
 SharedMemory *shm_ptr = NULL;
 int fd = -1;
+
+void cleanup(int sig);
 
 // Function to enable sychronization of mutex between processes
 void init_pshared_mutex_attr(pthread_mutexattr_t *attr){
@@ -85,6 +91,8 @@ int startup(){
     if(shm_ptr == MAP_FAILED){ perror("mmap of first process failed"); return -1; }
 
     pthread_mutex_init(&shm_ptr->system_mutex, &mutex_attr);
+    shm_ptr->current_dialogues_count = 0;
+    shm_ptr->last_dialogue_id = 0;
     memset(shm_ptr->dialogues_shm, 0, sizeof(shm_ptr->dialogues_shm)); // initialize(zero-out) the entire dialogue struct
 
     // Initialize mutexes and semaphores for all available dialogue slots
@@ -192,9 +200,9 @@ int join_dialogue(pid_t pid, int dialogue_id){
 }
 
 // function to remove a process from a dialogue
-// this function does not cause cleanup or a Terminate
 int remove_process_from_dialogue(pid_t pid, int dialogue_index){
 
+  if(dialogue_index < 0 || dialogue_index >= MAX_DIALOGUES) return 0;
   // if its already free, return
   if(shm_ptr->dialogues_shm[dialogue_index].status == DIALOGUE_FREE)  return 0; 
 
@@ -231,17 +239,22 @@ void *sender_thread(void *arg){
 
   char input[MSG_BUFFER_SIZE];
 
-  while(!a->terminate_flag){
+  while(!atomic_load(&a->terminate_flag)){
     //print menu
     printf("\n====== AVAILABLE ACTIONS ======\n");
     printf("1. Send message\n");
-    printf("2. Leave current dialogue\n");
-    printf("3. Terminate via (ctrl-c) or TERMINATE payload message\n");
+    printf("2. Terminate via (ctrl-c) or TERMINATE payload message\n");
+    printf("> ");
+    fflush(stdout);
 
     fgets(input, MSG_BUFFER_SIZE, stdin);
 
     // remove new line character
     input[strcspn(input, "\n")] = 0;
+
+    if(strlen(input) == 0){
+      continue;
+    }
 
     pthread_mutex_lock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
 
@@ -256,6 +269,7 @@ void *sender_thread(void *arg){
 
     strncpy(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, input, MSG_BUFFER_SIZE);
 
+    shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload[MSG_BUFFER_SIZE - 1] = '\0';
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.status = MESSAGE_FULL;
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.sender_id = pid;
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining = shm_ptr->dialogues_shm[dialogue_index].participant_count;
@@ -267,7 +281,8 @@ void *sender_thread(void *arg){
     pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
 
     if(isTerminate){
-      // trigger cleanup
+      printf("TERMINATE sent, writer exiting...\n");
+      atomic_store(&a->terminate_flag, true);
       break;
     }
   }
@@ -278,11 +293,16 @@ void *receiver_thread(void *arg){
 
   struct thread_args *a = (struct thread_args *)arg;
   int dialogue_index = a->dialogue_index;
-  int pid = a->pid;
+  pid_t pid = a->pid;
 
-  while(1){
+  while(!atomic_load(&a->terminate_flag)){
 
     sem_wait(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
+
+    if(atomic_load(&a->terminate_flag)){
+      break;
+    }
+
     pthread_mutex_lock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
 
     if(shm_ptr->dialogues_shm[dialogue_index].msg_struct.sender_id == pid){
@@ -290,17 +310,9 @@ void *receiver_thread(void *arg){
     }else{
       printf("\n\nDialogue ID: %d | Sent by: %d\n", shm_ptr->dialogues_shm[dialogue_index].dialogue_id, shm_ptr->dialogues_shm[dialogue_index].msg_struct.sender_id);
       printf("Message: %s\n", shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload);
-
-      // case for terminating thread/process/dialogue
-      if(strcmp(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, "TERMINATE") == 0){
-        shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining--;
-        if(shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining <= 0){
-          shm_ptr->dialogues_shm[dialogue_index].msg_struct.status = MESSAGE_FREE;
-        }
-        pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
-        pthread_exit(NULL);  // terminate thread
-      }
     }
+
+    int isTerminate = (strcmp(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, "TERMINATE") == 0);
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining--;
 
     // if this was last reader mark message slot as empty
@@ -308,23 +320,45 @@ void *receiver_thread(void *arg){
        shm_ptr->dialogues_shm[dialogue_index].msg_struct.status = MESSAGE_FREE;
     }
 
-    //check if same's process write wrote TERMINATE
-    if(strcmp(shm_ptr->dialogues_shm[dialogue_index].msg_struct.payload, "TERMINATE") == 0){
-       pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
-       pthread_exit(NULL);  // terminate thread
-    }
     pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+
+    if(isTerminate){
+      printf("TERMINATE received, receiver exiting...\n");
+      break;
+    }
   }
 
   return NULL;
 }
 
+void cleanup(int sig){
+  if(shm_ptr == NULL){
+    exit(0);
+  }
+
+  printf("\nCleaning up...\n");
+
+  if(global_dialogue_index >= 0){
+    int rem = remove_process_from_dialogue(global_pid, global_dialogue_index);
+
+    if(rem == 0){
+      printf("Last dialogue closed. removing shared memory...\n");
+      munmap(shm_ptr, sizeof(SharedMemory));
+      shm_unlink(SHM_NAME);
+      exit(0);
+    }
+  }
+    munmap(shm_ptr, sizeof(SharedMemory));
+    shm_unlink(SHM_NAME);
+}
 
 int main(int argc, char *argv[]){
 
   // dialogue target for process to enter
   int dialogue_id;
   pid_t mypid = getpid();
+
+  global_pid = mypid;
 
   signal(SIGINT, cleanup);
 
@@ -344,8 +378,12 @@ int main(int argc, char *argv[]){
 
   int dialogue_index = join_dialogue(mypid, dialogue_id);
   if(dialogue_index == -1){
+    munmap(shm_ptr, sizeof(SharedMemory));
+    close(fd);
     return -1;
   }
+
+  global_dialogue_index = dialogue_index;
 
   struct thread_args *args = malloc(sizeof(struct thread_args));
   args->dialogue_index = dialogue_index;
@@ -357,11 +395,23 @@ int main(int argc, char *argv[]){
   pthread_create(&sender, NULL, sender_thread, args);
   pthread_create(&receiver, NULL, receiver_thread, args);
 
+  pthread_join(sender, NULL);
+  pthread_join(receiver, NULL);
+
+  int rem = remove_process_from_dialogue(mypid, dialogue_index);
+
+  if(rem == 0){
+      printf("Last dialogue closed. removing shared memory...\n");
+      munmap(shm_ptr, sizeof(SharedMemory));
+      shm_unlink(SHM_NAME);
+  }else{
+    munmap(shm_ptr, sizeof(SharedMemory));
+  }
+
+  close(fd);
   free(args);
 
-
-  pthread_join(sender, NULL);
-  pthread_cancel(receiver);
+  printf("\n PROCESS TERMINATED\n");
 
   return 0;
 }
