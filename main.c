@@ -60,9 +60,9 @@ struct thread_args{
 pid_t global_pid = 0;
 int global_dialogue_index = -1;
 SharedMemory *shm_ptr = NULL;
-int fd = -1;
+int fd = -1;     // initialize the file descriptor to -1 so that in startup i can find out if its creator process or not 
 struct thread_args *global_args = NULL;  // Need reference to set terminate_flag
-int participant_index;
+int participant_index; // helper for the array of semaphores
 
 void cleanup();
 
@@ -247,6 +247,7 @@ void *sender_thread(void *arg){
 
   char input[MSG_BUFFER_SIZE];
 
+  // for reference for select and checking if data is available on stdin check links in bibliography
   fd_set readfds;
   struct timeval tv;
   int retval;
@@ -254,7 +255,7 @@ void *sender_thread(void *arg){
   while(!atomic_load(&a->terminate_flag)){
     //print menu
     printf("\n====== AVAILABLE ACTIONS ======\n");
-    printf("Send message, (CTRL-C) to kill process and remove it from dialogue or type TERMINATE to kill dialogue.\n");
+    printf("Send message, (CTRL-C) to kill process and remove it from dialogue or type TERMINATE(capital letters only) to kill dialogue.\n");
     printf("> ");
     fflush(stdout);
 
@@ -301,6 +302,7 @@ void *sender_thread(void *arg){
     pthread_mutex_lock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
     
     // run in while loop until msg slot is free, so that message is kept and not disgarded
+    // if used normal if statement the message would be lost and i would need to write it again
     while(shm_ptr->dialogues_shm[dialogue_index].msg_struct.status == MESSAGE_FULL){ 
         pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
         if(atomic_load(&a->terminate_flag)) break;
@@ -322,10 +324,6 @@ void *sender_thread(void *arg){
       }
     }
     
-    /*for(int i=0; i<shm_ptr->dialogues_shm[dialogue_index].participant_count; i++){
-      sem_post(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
-    }*/
-
     pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
 
     if(isTerminate){
