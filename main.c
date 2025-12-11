@@ -29,7 +29,7 @@
 
 typedef struct{
     pid_t sender_id;
-    sem_t sync_sem;
+    sem_t sync_sem[MAX_PARTICIPANTS];
     int status;
     char payload[MSG_BUFFER_SIZE];
     pthread_mutex_t msg_mutex;
@@ -62,6 +62,7 @@ int global_dialogue_index = -1;
 SharedMemory *shm_ptr = NULL;
 int fd = -1;
 struct thread_args *global_args = NULL;  // Need reference to set terminate_flag
+int participant_index;
 
 void cleanup();
 
@@ -101,11 +102,10 @@ int startup(){
     for(int i = 0; i < MAX_DIALOGUES; i++){
         pthread_mutex_init(&shm_ptr->dialogues_shm[i].msg_struct.msg_mutex, &mutex_attr);
         shm_ptr->dialogues_shm[i].status = DIALOGUE_FREE;
-        if(sem_init(&shm_ptr->dialogues_shm[i].msg_struct.sync_sem, 1, 0) == -1){        // initialize the semaphore once in first calling prcoess
-           perror("sem_init failed"); return -1;
+        for(int j=0; j<MAX_PARTICIPANTS; j++){
+          sem_init(&shm_ptr->dialogues_shm[i].msg_struct.sync_sem[j], 1, 0);
+        }
       }
-    }
-
   }else if(errno == EEXIST){
       // shared memory object already exists so just open it
       fd = shm_open(SHM_NAME, O_RDWR, 0666);
@@ -147,6 +147,7 @@ int join_dialogue(pid_t pid, int dialogue_id){
         shm_ptr->dialogues_shm[dialogue_index].dialogue_id = new_dialogue_id;
         shm_ptr->dialogues_shm[dialogue_index].participant_count = 1;
         shm_ptr->dialogues_shm[dialogue_index].participants[0] = pid;
+        participant_index = 0;
         shm_ptr->dialogues_shm[dialogue_index].status = DIALOGUE_ACTIVE;
         shm_ptr->last_dialogue_id++;         // updated last dialogue create
         shm_ptr->current_dialogues_count++;
@@ -183,6 +184,7 @@ int join_dialogue(pid_t pid, int dialogue_id){
         if(pos != -1){
            shm_ptr->dialogues_shm[dialogue_index].participant_count++;
            shm_ptr->dialogues_shm[dialogue_index].participants[pos] = pid;
+           participant_index = pos;
            pthread_mutex_unlock(&shm_ptr->system_mutex);
            printf("Joined dialogue ID: %d\n", dialogue_id);
            return dialogue_index;
@@ -297,12 +299,13 @@ void *sender_thread(void *arg){
     }
 
     pthread_mutex_lock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
-
-    // check if message slot is empty
-    if(shm_ptr->dialogues_shm[dialogue_index].msg_struct.status == MESSAGE_FULL){
-      printf("Error, slot is busy. Try again later.\n");
-      pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
-      continue; // retry the loop
+    
+    // run in while loop until msg slot is free, so that message is kept and not disgarded
+    while(shm_ptr->dialogues_shm[dialogue_index].msg_struct.status == MESSAGE_FULL){ 
+        pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
+        if(atomic_load(&a->terminate_flag)) break;
+        usleep(10000); // sleep 10ms
+        pthread_mutex_lock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
     }
 
     int isTerminate = (strcmp(input, "TERMINATE") == 0); // if input is "TERMINATE" strcmp will return 0 so isTerminate will be true
@@ -313,10 +316,15 @@ void *sender_thread(void *arg){
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.sender_id = pid;
     shm_ptr->dialogues_shm[dialogue_index].msg_struct.readers_remaining = shm_ptr->dialogues_shm[dialogue_index].participant_count;
 
-    // increase the semaphore value for each participant
-    for(int i=0; i<shm_ptr->dialogues_shm[dialogue_index].participant_count; i++){
-      sem_post(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
+    for(int i=0; i<MAX_PARTICIPANTS; i++){
+      if(shm_ptr->dialogues_shm[dialogue_index].participants[i] != 0){
+          sem_post(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem[i]);
+      }
     }
+    
+    /*for(int i=0; i<shm_ptr->dialogues_shm[dialogue_index].participant_count; i++){
+      sem_post(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
+    }*/
 
     pthread_mutex_unlock(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.msg_mutex);
 
@@ -343,7 +351,7 @@ void *receiver_thread(void *arg){
   // make sure terminate_flag is not raised
   while(!atomic_load(&a->terminate_flag)){
 
-    sem_wait(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem);
+    sem_wait(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem[participant_index]);
 
     // check for flag again
     if(atomic_load(&a->terminate_flag)){
@@ -463,6 +471,8 @@ int main(int argc, char *argv[]){
   pthread_create(&receiver, NULL, receiver_thread, args);
 
   pthread_join(sender, NULL);
+  // wake up receiver if stuck
+  sem_post(&shm_ptr->dialogues_shm[dialogue_index].msg_struct.sync_sem[participant_index]);
   pthread_join(receiver, NULL);
 
   int rem = remove_process_from_dialogue(mypid, dialogue_index);
